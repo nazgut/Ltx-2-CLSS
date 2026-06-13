@@ -10,10 +10,13 @@ source strategies are available:
 """
 
 from ltx_core.block_streaming.builder import DISK_CPU_SLOTS, StreamingModelBuilder
+from ltx_core.block_streaming.gguf_builder import GemmaGGUFStreamingModelBuilder, GGUFStreamingModelBuilder
 from ltx_core.block_streaming.wrapper import BlockStreamingWrapper
 
 __all__ = [
     "DISK_CPU_SLOTS",
     "BlockStreamingWrapper",
+    "GemmaGGUFStreamingModelBuilder",
+    "GGUFStreamingModelBuilder",
     "StreamingModelBuilder",
 ]

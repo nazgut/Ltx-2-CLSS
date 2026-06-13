@@ -41,6 +41,7 @@ class GemmaTextEncoder(torch.nn.Module):
         token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
         input_ids = torch.tensor([[t[0] for t in token_pairs]], device=self.model.device)
         attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=self.model.device)
+
         outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
         hidden_states = outputs.hidden_states
         del outputs

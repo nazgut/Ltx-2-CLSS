@@ -206,6 +206,7 @@ class DiffusionStage:
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         transformer_builder: ModelBuilderProtocol[LTXModel] | None = None,
+        streaming_builder: StreamingModelBuilder | None = None,
     ) -> None:
         self._checkpoint_path = checkpoint_path
         self._dtype = dtype
@@ -240,23 +241,26 @@ class DiffusionStage:
                     "Block streaming is not supported with this quantization policy "
                     "(only bf16 and fp8_cast are currently supported)."
                 )
-            streaming_sd_ops: SDOps = LTXV_MODEL_COMFY_RENAMING_MAP
-            streaming_module_ops: tuple[ModuleOps, ...] = ()
-            if quantization is not None:
-                streaming_sd_ops, streaming_module_ops = _chain_quantization(
-                    streaming_sd_ops, streaming_module_ops, quantization
+            if streaming_builder is not None:
+                self._streaming_builder = streaming_builder
+            else:
+                streaming_sd_ops: SDOps = LTXV_MODEL_COMFY_RENAMING_MAP
+                streaming_module_ops: tuple[ModuleOps, ...] = ()
+                if quantization is not None:
+                    streaming_sd_ops, streaming_module_ops = _chain_quantization(
+                        streaming_sd_ops, streaming_module_ops, quantization
+                    )
+                self._streaming_builder = StreamingModelBuilder(
+                    model_class_configurator=configurator,
+                    model_path=checkpoint_path,
+                    model_sd_ops=streaming_sd_ops,
+                    module_ops=streaming_module_ops,
+                    loras=tuple(loras),
+                    registry=registry or DummyRegistry(),
+                    fuse_rule=quantization.fuse_rule if quantization is not None else bf16_fuse_rule,
+                    blocks_attr="transformer_blocks",
+                    blocks_prefix="transformer_blocks",
                 )
-            self._streaming_builder = StreamingModelBuilder(
-                model_class_configurator=configurator,
-                model_path=checkpoint_path,
-                model_sd_ops=streaming_sd_ops,
-                module_ops=streaming_module_ops,
-                loras=tuple(loras),
-                registry=registry or DummyRegistry(),
-                fuse_rule=quantization.fuse_rule if quantization is not None else bf16_fuse_rule,
-                blocks_attr="transformer_blocks",
-                blocks_prefix="transformer_blocks",
-            )
 
     def with_attention(self, attention: AttentionFunction | AttentionCallable | None) -> "DiffusionStage":
         """Return a new ``DiffusionStage`` that pins the transformer build to ``attention``.
@@ -460,6 +464,7 @@ class PromptEncoder:
         registry: Registry | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         text_encoder_builder: BuilderProtocol | None = None,
+        streaming_text_encoder_builder: BuilderProtocol | None = None,
     ) -> None:
         self._gemma_root = gemma_root
         self._checkpoint_path = checkpoint_path
@@ -467,7 +472,12 @@ class PromptEncoder:
         self._device = device
         self._offload_mode = offload_mode
 
-        if text_encoder_builder is not None:
+        if streaming_text_encoder_builder is not None:
+            # Custom streaming builder (e.g. GGUF-backed) — skip safetensors loading.
+            # The builder must already include tokenizer/processor module_ops.
+            self._streaming_text_encoder_builder = streaming_text_encoder_builder
+            self._text_encoder_builder = text_encoder_builder  # may be None when offload is used
+        elif text_encoder_builder is not None:
             if offload_mode != OffloadMode.NONE:
                 raise ValueError(
                     "text_encoder_builder cannot be used with offload_mode != OffloadMode.NONE "
@@ -524,7 +534,15 @@ class PromptEncoder:
         enhance_prompt_seed: int = 42,
     ) -> list[EmbeddingsProcessorOutput]:
         """Encode *prompts* through Gemma -> embeddings processor, freeing each model after use."""
-        logger.info("Building text encoder from %s", self._gemma_root)
+        logger.info("Loading Gemma text encoder from GGUF")
+        if enhance_first_prompt and self._streaming_text_encoder_builder is not None:
+            logger.warning(
+                "--enhance-prompt is not usable with block-streaming Gemma: "
+                "model.generate() runs one full 46-block stream per token "
+                "(~7 s/token x 512 tokens ≈ 60 min). Enhancement skipped. "
+                "Write a detailed prompt manually instead."
+            )
+            enhance_first_prompt = False
         with self._text_encoder_ctx() as text_encoder:
             if enhance_first_prompt:
                 prompts = list(prompts)

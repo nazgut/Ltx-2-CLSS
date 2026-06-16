@@ -47,3 +47,5 @@ tmp
 
 # Binary files
 *.so
+
+tmp/

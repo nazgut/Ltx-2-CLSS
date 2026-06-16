@@ -251,7 +251,7 @@ class CLSSStreamingPipeline:
 
     def __call__(  # noqa: PLR0913
         self,
-        prompt: str,
+        prompts: list[str],
         negative_prompt: str,
         seed: int,
         height: int,
@@ -272,7 +272,11 @@ class CLSSStreamingPipeline:
 
         Parameters
         ----------
-        prompt, negative_prompt, seed, height, width, frame_rate,
+        prompts:
+            Per-chunk text prompts.  The i-th chunk uses ``prompts[i]``; if
+            fewer prompts than chunks are supplied, the last entry repeats.
+            Pass a single-element list for a uniform prompt across all chunks.
+        negative_prompt, seed, height, width, frame_rate,
         num_inference_steps, video_guider_params, audio_guider_params,
         images, enhance_prompt, tiling_config, max_batch_size, sigmas:
             Same semantics as TI2VidOneStagePipeline.
@@ -305,33 +309,40 @@ class CLSSStreamingPipeline:
         noiser = GaussianNoiser(generator=generator)
 
         # ------------------------------------------------------------------
-        # Encode prompts (once, shared across all chunks)
+        # Encode all per-chunk prompts + negative in one Gemma session.
+        # PromptEncoder.__call__ accepts a list[str] and loads Gemma exactly
+        # once, so N prompts cost the same Gemma-load budget as 1.
+        # Layout: [prompt_0, prompt_1, …, prompt_P-1, negative_prompt]
         # ------------------------------------------------------------------
-        ctx_p, ctx_n = self.prompt_encoder(
-            [prompt, negative_prompt],
+        all_texts = list(prompts) + [negative_prompt]
+        all_contexts = self.prompt_encoder(
+            all_texts,
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_seed=seed,
         )
-        v_ctx_p, a_ctx_p = ctx_p.video_encoding, ctx_p.audio_encoding
-        v_ctx_n, a_ctx_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        # chunk_contexts[i] is used for chunk i (last entry repeats for remaining chunks).
+        chunk_contexts = all_contexts[:-1]
+        ctx_n = all_contexts[-1]
+        v_ctx_n = ctx_n.video_encoding
+        a_ctx_n = ctx_n.audio_encoding
 
-        # Prompt diagnostics — detect degenerate context (weak CFG = prompt has no effect).
-        # NOTE: do NOT use full-tensor cosine similarity here.  Both sequences are padded to
-        # the same max length (1024 tokens).  Positions beyond the actual prompt length contain
-        # the same padding-token embedding in both cond and uncond, which dominates the dot
-        # product and makes the cosine artificially high (typically ~0.97).  The padding
-        # cancels exactly in cond-uncond, so CFG is not affected.  Use
-        # ||cond - uncond|| / ||cond|| as the guidance-strength metric instead.
+        # Diagnostics on prompt 0 (representative; low CFG strength = prompt ignored).
+        # NOTE: full-tensor cosine is misleading here — padding tokens are identical in
+        # cond/uncond and dominate.  Use ||cond-uncond||/||cond|| instead.
+        v_ctx_p_0 = chunk_contexts[0].video_encoding
         with torch.no_grad():
-            v_p_norm = v_ctx_p.float().norm().item()
+            v_p_norm = v_ctx_p_0.float().norm().item()
             v_n_norm = v_ctx_n.float().norm().item()
-            v_diff_norm = (v_ctx_p - v_ctx_n).float().norm().item()
+            v_diff_norm = (v_ctx_p_0 - v_ctx_n).float().norm().item()
             v_cfg_strength = v_diff_norm / (v_p_norm + 1e-8)
         logger.info(
-            "[prompt] video ctx  pos_norm=%.1f  neg_norm=%.1f  "
+            "[prompt] %d per-chunk prompts (last repeats for remaining chunks)",
+            len(chunk_contexts),
+        )
+        logger.info(
+            "[prompt] video ctx[0]  pos_norm=%.1f  neg_norm=%.1f  "
             "||cond-uncond||/||cond||=%.4f  "
-            "(< 0.05 → CFG direction is tiny, prompt has little effect; "
-            "padding inflates cosine—use this ratio instead)",
+            "(< 0.05 → CFG direction is tiny; padding inflates cosine—use this ratio instead)",
             v_p_norm, v_n_norm, v_cfg_strength,
         )
         if v_cfg_strength < 0.05:
@@ -340,12 +351,30 @@ class CLSSStreamingPipeline:
                 "Try a stronger negative prompt or check embeddings processor output.",
                 v_cfg_strength,
             )
-        if v_ctx_p is None:
-            logger.error("[prompt] v_ctx_p is None — video context is missing, generation will be unconditioned!")
         if v_ctx_n is None:
             logger.error("[prompt] v_ctx_n is None — negative context missing, CFG will be disabled!")
-        if a_ctx_p is None:
-            logger.warning("[prompt] a_ctx_p is None — audio context missing, audio generation is unconditioned")
+
+        a_ctx_p_0 = chunk_contexts[0].audio_encoding
+        if a_ctx_p_0 is None:
+            logger.warning("[prompt] a_ctx_p[0] is None — audio context missing; "
+                           "audio generation will be unconditioned (may produce noise)")
+        else:
+            with torch.no_grad():
+                a_p_norm = a_ctx_p_0.float().norm().item()
+                a_n_norm = a_ctx_n.float().norm().item() if a_ctx_n is not None else 0.0
+                a_diff_norm = (a_ctx_p_0 - a_ctx_n).float().norm().item() if a_ctx_n is not None else a_p_norm
+                a_cfg_strength = a_diff_norm / (a_p_norm + 1e-8)
+            logger.info(
+                "[prompt] audio ctx[0]  pos_norm=%.1f  neg_norm=%.1f  "
+                "||cond-uncond||/||cond||=%.4f",
+                a_p_norm, a_n_norm, a_cfg_strength,
+            )
+            if a_cfg_strength < 0.05:
+                logger.warning(
+                    "[prompt] Audio CFG direction is very weak (%.4f). "
+                    "Audio will be generated without meaningful conditioning.",
+                    a_cfg_strength,
+                )
 
         video_guider_factory = create_multimodal_guider_factory(
             params=video_guider_params,
@@ -406,14 +435,22 @@ class CLSSStreamingPipeline:
 
         all_new_video_latents: list[torch.Tensor] = []
         all_new_audio_latents: list[torch.Tensor] = []
+        # Cumulative audio latent frames at end of each chunk (= boundary positions in concat latent)
+        audio_chunk_ends: list[int] = []
 
-        # Audio overlap conditioning: last overlap_audio_lf frames of the previous chunk's audio.
-        # Passed as negative-position reference tokens to help the model continue audio smoothly.
+        # Audio overlap conditioning: audio latent frames from BEFORE the next chunk's overlap period,
+        # placed at negative RoPE positions to tell the model "this is what happened before t=0."
+        # CRITICAL: the reference must NOT include the overlap period itself (which will be re-generated).
+        # It must be the audio PRECEDING the overlap — so it represents true past context.
         prev_audio_overlap: Optional[torch.Tensor] = None
         # Precompute how many audio latent frames correspond to one video overlap period (constant).
         _overlap_audio_lf = round(
             _latent_to_pixel_frames(clss_config.overlap_latent_frames) / frame_rate * _AUDIO_LATENTS_PER_SEC
         )
+        # Rolling audio tail: last 2×_overlap_audio_lf frames of accumulated output, kept across chunks.
+        # This lets us reference audio from just before the overlap even when it spans a chunk boundary.
+        _audio_tail_size = 2 * _overlap_audio_lf
+        _audio_tail: Optional[torch.Tensor] = None
 
         # ------------------------------------------------------------------
         # Keep the transformer in GPU memory across all chunks
@@ -446,6 +483,17 @@ class CLSSStreamingPipeline:
                     len(anchor_conds),
                 )
 
+                # Per-chunk prompt context — last entry repeats if fewer prompts than chunks
+                ctx_p_i = chunk_contexts[min(chunk_idx, len(chunk_contexts) - 1)]
+                v_ctx_p_i = ctx_p_i.video_encoding
+                a_ctx_p_i = ctx_p_i.audio_encoding
+                if chunk_idx < len(chunk_contexts):
+                    logger.info(
+                        "[CLSS] chunk=%d/%d  prompt %d/%d",
+                        chunk_idx + 1, len(chunk_schedule),
+                        chunk_idx + 1, len(chunk_contexts),
+                    )
+
                 # Audio overlap conditioning: reference tokens from the previous chunk's tail
                 # positioned "before" t=0 so the model continues from where audio left off.
                 audio_conds = []
@@ -458,8 +506,8 @@ class CLSSStreamingPipeline:
                     )
 
                 denoiser = FactoryGuidedDenoiser(
-                    v_context=v_ctx_p,
-                    a_context=a_ctx_p,
+                    v_context=v_ctx_p_i,
+                    a_context=a_ctx_p_i,
                     video_guider_factory=video_guider_factory,
                     audio_guider_factory=audio_guider_factory,
                 )
@@ -476,10 +524,10 @@ class CLSSStreamingPipeline:
                     frames=chunk_pixel_frames,
                     fps=frame_rate,
                     video=ModalitySpec(
-                        context=v_ctx_p,
+                        context=v_ctx_p_i,
                         conditionings=all_conditionings,
                     ),
-                    audio=ModalitySpec(context=a_ctx_p, conditionings=audio_conds),
+                    audio=ModalitySpec(context=a_ctx_p_i, conditionings=audio_conds),
                     max_batch_size=max_batch_size,
                 )
                 t_denoise = time.perf_counter() - t_denoise_start
@@ -496,9 +544,11 @@ class CLSSStreamingPipeline:
                 t_post = time.perf_counter() - t_post_start
 
                 # Boundary continuity: compare last frame of previous chunk to first of current
+                # (previous chunk's latent lives on CPU now — see the CPU-offload note below —
+                # so bring just this one frame back to the current device for the comparison.)
                 if all_new_video_latents:
                     with torch.no_grad():
-                        prev_last = all_new_video_latents[-1][:, :, -1:].float()
+                        prev_last = all_new_video_latents[-1][:, :, -1:].to(corrected_video.device).float()
                         curr_first = corrected_video[:, :, :1].float()
                         boundary_l2 = (prev_last - curr_first).norm().item()
                         p_feat = torch.nn.functional.normalize(prev_last.flatten(1), dim=1)
@@ -529,7 +579,17 @@ class CLSSStreamingPipeline:
                     chunk_idx + 1, len(chunk_schedule), t_denoise, t_post,
                 )
 
-                all_new_video_latents.append(corrected_video)
+                # Offload to CPU immediately: only the small per-chunk overlap/anchor
+                # state (kept inside clss_state) is needed on GPU for the next chunk.
+                # Holding every chunk's full latent on GPU competes with the resident
+                # NF4 transformer + this chunk's activations for VRAM — with long
+                # videos (many chunks) this is the difference between fitting in
+                # 16 GB and OOMing a few chunks in. Latents are reassembled and
+                # moved back to GPU once, right before the final VAE decode.
+                all_new_video_latents.append(corrected_video.detach().to("cpu"))
+                del corrected_video
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 # Audio: drop overlap frames from non-first chunks so audio duration
                 # matches video duration.  The overlap period was already covered by
@@ -547,13 +607,54 @@ class CLSSStreamingPipeline:
                             chunk_idx + 1, len(chunk_schedule),
                             overlap_audio_lf, overlap_lf, overlap_px, overlap_px / frame_rate,
                         )
-                    all_new_audio_latents.append(audio_latent)
+                    logger.info(
+                        "[CLSS] chunk=%d/%d  audio latent shape %s  energy=%.4f",
+                        chunk_idx + 1, len(chunk_schedule),
+                        tuple(audio_latent.shape),
+                        audio_latent.float().norm().item() / (audio_latent.numel() ** 0.5),
+                    )
+                    # Audio latents are tiny vs. video, but offload them too for
+                    # consistency — `audio_latent` itself stays on GPU below for the
+                    # rolling-tail / overlap-reference bookkeeping.
+                    all_new_audio_latents.append(audio_latent.detach().to("cpu"))
+                    audio_chunk_ends.append(sum(a.shape[2] for a in all_new_audio_latents))
 
-                    # Save the tail of this chunk's new audio for next chunk's reference conditioning.
-                    # Use the minimum of _overlap_audio_lf and available frames to handle short chunks.
-                    ref_len = min(_overlap_audio_lf, audio_latent.shape[2])
-                    if ref_len > 0:
-                        prev_audio_overlap = audio_latent[:, :, -ref_len:].clone()
+                    # Maintain a rolling audio tail of the last 2×_overlap_audio_lf frames.
+                    # This lets us reference audio from BEFORE the next overlap even when that
+                    # boundary falls in a previous chunk.
+                    if _audio_tail is None:
+                        _audio_tail = audio_latent
+                    else:
+                        _audio_tail = torch.cat([_audio_tail, audio_latent], dim=2)
+                    if _audio_tail.shape[2] > _audio_tail_size:
+                        _audio_tail = _audio_tail[:, :, -_audio_tail_size:]
+                    _audio_tail = _audio_tail.clone()
+
+                    # Reference = audio just BEFORE the next chunk's overlap period.
+                    # In the tail, the last _overlap_audio_lf frames = the next overlap region.
+                    # The reference is the _overlap_audio_lf frames that precede that region.
+                    tail_lf = _audio_tail.shape[2]
+                    pre_overlap_end = max(0, tail_lf - _overlap_audio_lf)
+                    if pre_overlap_end > 0:
+                        ref_start = max(0, pre_overlap_end - _overlap_audio_lf)
+                        prev_audio_overlap = _audio_tail[:, :, ref_start:pre_overlap_end].clone()
+                        logger.debug(
+                            "[CLSS] chunk=%d/%d  audio reference saved: %d frames (%.2f s) "
+                            "ending %.2f s before next overlap",
+                            chunk_idx + 1, len(chunk_schedule),
+                            prev_audio_overlap.shape[2],
+                            prev_audio_overlap.shape[2] / _AUDIO_LATENTS_PER_SEC,
+                            _overlap_audio_lf / _AUDIO_LATENTS_PER_SEC,
+                        )
+                    else:
+                        # Tail shorter than overlap; use beginning as best effort
+                        if tail_lf > 0:
+                            prev_audio_overlap = _audio_tail[:, :, :min(tail_lf, _overlap_audio_lf)].clone()
+                        logger.debug(
+                            "[CLSS] chunk=%d/%d  audio tail too short (%d frames) for "
+                            "pre-overlap reference; using as-is",
+                            chunk_idx + 1, len(chunk_schedule), tail_lf,
+                        )
 
         # ------------------------------------------------------------------
         # Concatenate all chunks and decode
@@ -571,9 +672,9 @@ class CLSSStreamingPipeline:
         # overlap buffer are still allocated.  Releasing them recovers several GB of
         # VRAM that the VAE decoder needs for long videos.
         del all_new_video_latents       # chunks are now in full_video_latent
-        del v_ctx_p, v_ctx_n, a_ctx_p, a_ctx_n
+        del chunk_contexts, v_ctx_n, a_ctx_n
         del video_guider_factory, audio_guider_factory
-        del prev_audio_overlap
+        del prev_audio_overlap, _audio_tail
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         logger.info("GPU memory freed before VAE decode.")
@@ -581,15 +682,70 @@ class CLSSStreamingPipeline:
         # Audio is decoded eagerly (small latent, fast); video is decoded lazily
         # via the tiled iterator so only one tile is on GPU at a time.
         if all_new_audio_latents:
-            full_audio_latent = torch.cat(all_new_audio_latents, dim=2)
+            # Chunks were offloaded to CPU during the loop; reassemble and bring
+            # back to GPU now, once, for decoding.
+            full_audio_latent = torch.cat(all_new_audio_latents, dim=2).to(self.device)
             del all_new_audio_latents
+
+            # Smooth the audio latent at each chunk boundary to reduce clicks.
+            # The last frame of chunk K and the first frame of chunk K+1 are
+            # independently generated, so they may be discontinuous.  A short
+            # bilateral blend in latent space (visible to the causal decoder)
+            # softens the transition without introducing silence.
+            _smooth_half = 2  # number of frames on each side to blend
+            for boundary in audio_chunk_ends[:-1]:   # skip the very last boundary
+                b = boundary
+                lf_total = full_audio_latent.shape[2]
+                if b < _smooth_half or b + _smooth_half > lf_total:
+                    continue
+                for i in range(1, _smooth_half + 1):
+                    alpha = i / (_smooth_half + 1)   # 0.33, 0.67
+                    # Frame just before boundary: blend toward frame at boundary
+                    pos_prev = b - i
+                    full_audio_latent[:, :, pos_prev] = (
+                        (1.0 - alpha) * full_audio_latent[:, :, pos_prev] +
+                        alpha * full_audio_latent[:, :, b]
+                    )
+                    # Frame just after boundary: blend toward frame before boundary
+                    pos_next = b + i - 1
+                    full_audio_latent[:, :, pos_next] = (
+                        (1.0 - alpha) * full_audio_latent[:, :, pos_next] +
+                        alpha * full_audio_latent[:, :, b - 1]
+                    )
+            logger.debug(
+                "[CLSS] audio latent smoothed at %d boundaries (±%d frames each)",
+                len(audio_chunk_ends) - 1, _smooth_half,
+            )
+
+            logger.info(
+                "[CLSS] full audio latent: shape=%s  energy=%.4f",
+                tuple(full_audio_latent.shape),
+                full_audio_latent.float().norm().item() / (full_audio_latent.numel() ** 0.5),
+            )
             decoded_audio = self.audio_decoder(full_audio_latent)
             del full_audio_latent
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            # Waveform diagnostics
+            wf = decoded_audio.waveform
+            rms = wf.float().pow(2).mean().sqrt().item()
+            peak = wf.float().abs().max().item()
+            logger.info(
+                "[CLSS] decoded audio: sr=%d Hz  shape=%s  rms=%.4f  peak=%.4f%s",
+                decoded_audio.sampling_rate,
+                tuple(wf.shape),
+                rms, peak,
+                "  [WARNING: near-silent — audio may be blank]" if rms < 0.001 else "",
+            )
         else:
             decoded_audio = Audio(waveform=torch.zeros(1, 0), sampling_rate=16000)
+            logger.warning("[CLSS] no audio latents collected — returning silent audio")
 
+        # Chunks were offloaded to CPU during the loop; reassemble and bring back
+        # to GPU now, once, for decoding (the VAE decoder forward pass requires its
+        # input on the same device as its weights).
+        full_video_latent = full_video_latent.to(self.device)
         decoded_video = self.video_decoder(full_video_latent, tiling_config, generator=generator)
 
         return decoded_video, decoded_audio
@@ -645,7 +801,7 @@ def main() -> None:
     )
 
     video, audio = pipeline(
-        prompt=args.prompt,
+        prompts=[args.prompt],
         negative_prompt=args.negative_prompt,
         seed=args.seed,
         height=args.height,

@@ -28,9 +28,11 @@ one latent frame):
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -45,12 +47,14 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.patchifiers import AudioPatchifier
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.conditioning import AudioConditionByReferenceLatent
+from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.primitives import ModelBuilderProtocol
 from ltx_core.loader.registry import Registry
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.transformer import LTXModel
 from ltx_core.model.video_vae.tiling import TilingConfig
+from ltx_core.model.video_vae.video_vae import get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio, AudioLatentShape
 from ltx_pipelines.utils import (
@@ -267,6 +271,8 @@ class CLSSStreamingPipeline:
         tiling_config: Optional[TilingConfig] = None,
         max_batch_size: int = 1,
         sigmas: Optional[torch.Tensor] = None,
+        checkpoint_dir: Optional[str] = None,
+        checkpoint_every: int = 5,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         """Generate *num_frames* pixel frames as a streaming CLSS video.
 
@@ -287,6 +293,26 @@ class CLSSStreamingPipeline:
         clss_config:
             CLSS algorithm configuration.  Defaults to CLSSConfig() with the
             paper-recommended values (tau_c=0.15, beta=0.3, new_latent_frames=21).
+        checkpoint_dir:
+            If set, a per-chunk JSONL log (timing, boundary/intra-chunk
+            similarity, anchor-bank size, audio energy, ...) is written to
+            ``{checkpoint_dir}/clss_chunks.jsonl`` for post-hoc analysis.
+            When the schedule has more than ``checkpoint_every`` chunks, the
+            accumulated (CPU-resident) latents are additionally snapshotted to
+            ``{checkpoint_dir}/clss_progress_chunk{N}.pt`` every
+            ``checkpoint_every`` chunks, so a crash late in a long generation
+            doesn't lose everything decoded so far. Snapshots are cumulative
+            (each contains all chunks up to that point), not deltas. Each
+            snapshot is also best-effort decoded to a preview
+            ``{checkpoint_dir}/clss_preview_chunk{N}.mp4`` so generation
+            quality can be checked without waiting for the full run; if VRAM
+            is too tight (the transformer is still resident on GPU at this
+            point) the preview is skipped and a warning logged, without
+            aborting the generation.
+        checkpoint_every:
+            Chunk interval for latent snapshots (see ``checkpoint_dir``).  Has
+            no effect when ``checkpoint_dir`` is None or the schedule has
+            ``checkpoint_every`` chunks or fewer.
         """
         if clss_config is None:
             clss_config = CLSSConfig()
@@ -429,6 +455,23 @@ class CLSSStreamingPipeline:
         )
 
         # ------------------------------------------------------------------
+        # Checkpointing / per-chunk logging (optional)
+        # ------------------------------------------------------------------
+        log_path: Optional[Path] = None
+        do_latent_checkpoints = False
+        if checkpoint_dir is not None:
+            checkpoint_path = Path(checkpoint_dir)
+            checkpoint_path.mkdir(parents=True, exist_ok=True)
+            log_path = checkpoint_path / "clss_chunks.jsonl"
+            do_latent_checkpoints = len(chunk_schedule) > checkpoint_every
+            logger.info(
+                "[CLSS] per-chunk log: %s%s",
+                log_path,
+                f"  (latent checkpoints every {checkpoint_every} chunks: {checkpoint_path})"
+                if do_latent_checkpoints else "",
+            )
+
+        # ------------------------------------------------------------------
         # CLSS state
         # ------------------------------------------------------------------
         clss_state = CLSSState(clss_config)
@@ -437,6 +480,10 @@ class CLSSStreamingPipeline:
         all_new_audio_latents: list[torch.Tensor] = []
         # Cumulative audio latent frames at end of each chunk (= boundary positions in concat latent)
         audio_chunk_ends: list[int] = []
+        # RMS energy of the first chunk's audio latent — used to soft-normalise
+        # later chunks and prevent the compounding energy-decay that occurs when
+        # each chunk is conditioned on its own (slightly quieter) previous audio.
+        _audio_rms_ref: Optional[float] = None
 
         # Audio overlap conditioning: audio latent frames from BEFORE the next chunk's overlap period,
         # placed at negative RoPE positions to tell the model "this is what happened before t=0."
@@ -512,6 +559,16 @@ class CLSSStreamingPipeline:
                     audio_guider_factory=audio_guider_factory,
                 )
 
+                # §3.7 g-measurement: save generator state before baseline pass so
+                # we can replay with the same noise on the perturbed overlap.
+                do_g_measurement = (
+                    not is_first
+                    and clss_config.measure_g
+                    and generator is not None
+                    and clss_state._overlap_latent is not None
+                )
+                gen_state_for_g = generator.get_state() if do_g_measurement else None
+
                 # Denoising loop for this chunk ----------------------------
                 t_denoise_start = time.perf_counter()
                 video_state, audio_state = self.stage.run(
@@ -535,6 +592,73 @@ class CLSSStreamingPipeline:
                 # video_state.latent: [1, C, total_chunk_lf, H, W] (unpatchified)
                 chunk_video_latent = video_state.latent
 
+                # §3.7 g-measurement: run a second denoising pass with a perturbed
+                # overlap latent (same noise seed) to measure the model's open-loop
+                # error amplification g = ||Δ_output||_F / ||δ_input||_F.
+                if do_g_measurement:
+                    eps = clss_config.measure_g_epsilon
+                    overlap = clss_state._overlap_latent  # [1, C, Fov, H, W]
+                    delta = torch.randn_like(overlap)
+                    delta = delta * (eps * overlap.float().norm() / delta.float().norm().clamp(min=1e-8))
+                    perturbed_overlap_conds = [
+                        VideoConditionByLatentIndex(
+                            latent=overlap + delta.to(overlap.dtype),
+                            strength=1.0 - clss_config.tau_c,
+                            latent_idx=0,
+                        )
+                    ]
+                    generator.set_state(gen_state_for_g)
+                    logger.info("[CLSS] chunk=%d/%d  g-measurement: running perturbed denoising pass …",
+                                chunk_idx + 1, len(chunk_schedule))
+                    t_g_start = time.perf_counter()
+                    video_state_p, _ = self.stage.run(
+                        transformer=transformer,
+                        denoiser=denoiser,
+                        sigmas=chunk_sigmas,
+                        noiser=noiser,
+                        width=width,
+                        height=height,
+                        frames=chunk_pixel_frames,
+                        fps=frame_rate,
+                        video=ModalitySpec(
+                            context=v_ctx_p_i,
+                            conditionings=perturbed_overlap_conds + anchor_conds + user_conds,
+                        ),
+                        audio=ModalitySpec(context=a_ctx_p_i, conditionings=audio_conds),
+                        max_batch_size=max_batch_size,
+                    )
+                    t_g = time.perf_counter() - t_g_start
+                    baseline_new = chunk_video_latent[:, :, overlap_lf:].float()
+                    perturbed_new = video_state_p.latent[:, :, overlap_lf:].float()
+                    del video_state_p
+                    delta_in = delta.float().norm().item()
+
+                    # Full g: all new frames (diagnostic only — overcounts because
+                    # frames far from the next overlap don't feed back)
+                    delta_out_full = (perturbed_new - baseline_new).float().norm().item()
+                    g_full = delta_out_full / max(delta_in, 1e-8)
+
+                    # SLB g: only the last overlap_lf new frames, which become the
+                    # Streaming Latent Buffer for the next chunk.  This is the
+                    # stability-relevant gain (§3.7): small perturbation in overlap_k
+                    # → how much does it change the SLB that becomes overlap_{k+1}?
+                    delta_out_slb = (
+                        perturbed_new[:, :, -overlap_lf:] - baseline_new[:, :, -overlap_lf:]
+                    ).float().norm().item()
+                    g_val = delta_out_slb / max(delta_in, 1e-8)
+
+                    rho_loop_cfg = (1.0 - clss_config.beta) * (1.0 - clss_config.tau_c)
+                    rho_closed_val = g_val * rho_loop_cfg
+                    clss_state.g_measured = g_val
+                    clss_state.rho_closed = rho_closed_val
+                    logger.info(
+                        "[CLSS] chunk=%d/%d  g_slb=%.4f  g_full=%.4f  "
+                        "ρ_loop=%.4f  ρ_closed=%.4f  [%.1fs]  %s",
+                        chunk_idx + 1, len(chunk_schedule),
+                        g_val, g_full, rho_loop_cfg, rho_closed_val, t_g,
+                        "STABLE" if rho_closed_val < 1.0 else "UNSTABLE",
+                    )
+
                 # Drop the overlap region — it was already output in the previous chunk
                 new_video_latent = chunk_video_latent[:, :, overlap_lf:]  # [1, C, new_lf, H, W]
 
@@ -542,6 +666,11 @@ class CLSSStreamingPipeline:
                 t_post_start = time.perf_counter()
                 corrected_video = clss_state.post_process(new_video_latent)
                 t_post = time.perf_counter() - t_post_start
+
+                # Defaults for the JSONL log record below — not every metric is
+                # computed every chunk (boundary_sim needs a previous chunk;
+                # intra_sim is DEBUG-only).
+                boundary_sim = boundary_l2 = intra_sim = audio_energy = None
 
                 # Boundary continuity: compare last frame of previous chunk to first of current
                 # (previous chunk's latent lives on CPU now — see the CPU-offload note below —
@@ -607,11 +736,31 @@ class CLSSStreamingPipeline:
                             chunk_idx + 1, len(chunk_schedule),
                             overlap_audio_lf, overlap_lf, overlap_px, overlap_px / frame_rate,
                         )
+                    audio_energy = audio_latent.float().norm().item() / (audio_latent.numel() ** 0.5)
+
+                    # Soft energy normalisation: mirror the video AdaIN σ-cap idea
+                    # for audio.  Track the first chunk's RMS; subsequent chunks are
+                    # gently scaled (blend β=0.3) toward that reference energy so that
+                    # the compounding quiet-drift (each chunk conditioned on a slightly
+                    # quieter previous audio overlap) is corrected before the latent is
+                    # stored and used as the next chunk's reference.
+                    if _audio_rms_ref is None:
+                        _audio_rms_ref = audio_energy
+                    elif audio_energy > 1e-6:
+                        _audio_beta = 0.3
+                        gain = _audio_rms_ref / audio_energy
+                        # Cap: only correct downward drift (gain > 1).
+                        # Don't attenuate genuinely louder chunks.
+                        if gain > 1.0:
+                            corrected_gain = 1.0 + _audio_beta * (gain - 1.0)
+                            audio_latent = audio_latent * corrected_gain
+                            audio_energy = audio_latent.float().norm().item() / (audio_latent.numel() ** 0.5)
+
                     logger.info(
                         "[CLSS] chunk=%d/%d  audio latent shape %s  energy=%.4f",
                         chunk_idx + 1, len(chunk_schedule),
                         tuple(audio_latent.shape),
-                        audio_latent.float().norm().item() / (audio_latent.numel() ** 0.5),
+                        audio_energy,
                     )
                     # Audio latents are tiny vs. video, but offload them too for
                     # consistency — `audio_latent` itself stays on GPU below for the
@@ -655,6 +804,90 @@ class CLSSStreamingPipeline:
                             "pre-overlap reference; using as-is",
                             chunk_idx + 1, len(chunk_schedule), tail_lf,
                         )
+
+                # ------------------------------------------------------------
+                # Per-chunk JSONL log + periodic latent checkpoint (optional)
+                # ------------------------------------------------------------
+                if log_path is not None:
+                    record = {
+                        "chunk_idx": chunk_idx + 1,
+                        "total_chunks": len(chunk_schedule),
+                        "total_chunk_latent_frames": total_chunk_lf,
+                        "overlap_latent_frames": overlap_lf,
+                        "new_latent_frames": chunk_new_lf,
+                        "denoise_seconds": t_denoise,
+                        "post_process_seconds": t_post,
+                        "boundary_cosine_sim": boundary_sim,
+                        "boundary_l2_dist": boundary_l2,
+                        "intra_chunk_cosine_sim": intra_sim,
+                        "audio_energy": audio_energy,
+                        "anchor_bank_size": len(clss_state._anchor_bank.anchors),
+                        "g_slb": clss_state.g_measured,
+                        "rho_closed": clss_state.rho_closed,
+                        "beta": clss_config.beta,
+                        "timestamp": time.time(),
+                    }
+                    with open(log_path, "a") as f:
+                        f.write(json.dumps(record) + "\n")
+
+                if do_latent_checkpoints and (chunk_idx + 1) % checkpoint_every == 0:
+                    ckpt_file = checkpoint_path / f"clss_progress_chunk{chunk_idx + 1:03d}.pt"
+                    torch.save(
+                        {
+                            "chunk_idx": chunk_idx,
+                            "chunks_done": chunk_idx + 1,
+                            "total_chunks": len(chunk_schedule),
+                            # Cumulative — each snapshot contains every chunk decoded so far.
+                            "video_latents": all_new_video_latents,
+                            "audio_latents": all_new_audio_latents,
+                            "audio_chunk_ends": audio_chunk_ends,
+                        },
+                        ckpt_file,
+                    )
+                    logger.info(
+                        "[CLSS] checkpoint saved: %s (%d/%d chunks)",
+                        ckpt_file, chunk_idx + 1, len(chunk_schedule),
+                    )
+
+                    # Also decode a preview .mp4 so generation quality can be eyeballed
+                    # without waiting for the full run. Best-effort: the NF4/streaming
+                    # transformer is still resident on GPU at this point in the loop, so
+                    # there may not be enough headroom left for the VAE decoder on long
+                    # videos — in that case we skip the preview rather than abort the run.
+                    try:
+                        preview_video_latent = torch.cat(all_new_video_latents, dim=2).to(self.device)
+                        if all_new_audio_latents:
+                            preview_audio_latent = torch.cat(all_new_audio_latents, dim=2).to(self.device)
+                            preview_audio = self.audio_decoder(preview_audio_latent)
+                            del preview_audio_latent
+                        else:
+                            preview_audio = Audio(waveform=torch.zeros(1, 0), sampling_rate=16000)
+                        preview_pixel_frames = _latent_to_pixel_frames(preview_video_latent.shape[2])
+                        preview_video_iter = self.video_decoder(
+                            preview_video_latent, tiling_config, generator=generator,
+                        )
+                        preview_file = checkpoint_path / f"clss_preview_chunk{chunk_idx + 1:03d}.mp4"
+                        encode_video(
+                            video=preview_video_iter,
+                            fps=frame_rate,
+                            audio=preview_audio,
+                            output_path=str(preview_file),
+                            video_chunks_number=get_video_chunks_number(preview_pixel_frames, tiling_config),
+                        )
+                        logger.info(
+                            "[CLSS] preview video saved: %s (%d/%d chunks)",
+                            preview_file, chunk_idx + 1, len(chunk_schedule),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[CLSS] preview decode failed at chunk %d/%d (likely insufficient "
+                            "VRAM alongside resident transformer) — skipping preview, "
+                            "continuing generation",
+                            chunk_idx + 1, len(chunk_schedule), exc_info=True,
+                        )
+                    finally:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
         # ------------------------------------------------------------------
         # Concatenate all chunks and decode

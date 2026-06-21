@@ -49,3 +49,4 @@ tmp
 *.so
 
 tmp/
+output_clss_checkpoints/

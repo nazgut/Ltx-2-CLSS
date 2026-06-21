@@ -127,14 +127,24 @@ class CLSSConfig:
     tau_c: float = 0.05
 
     # §2.3  EMA-tracked per-channel distribution reference
-    beta: float = 0.3
+    beta: float = 0.4
     ema_lambda: float = 0.05
+    # Cap on how far the per-channel EMA std may grow relative to its initial
+    # value (chunk-0 statistics).  0.0 = uncapped (old behaviour, allows σ drift).
+    # With the default 0.05 the reference std is allowed to increase at most 5 %
+    # from chunk 0's value, which prevents AdaIN from quietly amplifying late chunks
+    # while still permitting slow intentional brightening / saturation changes.
+    ema_sigma_max_drift: float = 0.05
 
     # §2.4  Frequency-band soft shrinkage
     # Keep gamma conservative: high values (0.5+) over-attenuate mid-frequency
     # content and degrade cosine similarity at chunk boundaries.
     n_freq_bands: int = 4
-    freq_gamma: tuple[float, ...] = (0.0, 0.0, 0.2, 0.3)
+    # Band 0 = DC (never shrink: would kill global color/brightness).
+    # Band 1 = low spatial/temporal frequency: small γ prevents gradual energy
+    #          compounding without touching scene structure (observed +18-19 %
+    #          uncorrected growth over 17 chunks in testing).
+    freq_gamma: tuple[float, ...] = (0.0, 0.05, 0.2, 0.3)
 
     # §2.5  Dynamic anchor bank
     anchor_threshold: float = 0.78
@@ -142,6 +152,11 @@ class CLSSConfig:
     anchor_max_size: int = 8
     anchor_top_m: int = 2
     anchor_strength: float = 1.0
+    # Force a new anchor every N chunks regardless of similarity.  0 = disabled.
+    # Without this, on visually-stable scenes the bank stagnates (similarity stays
+    # above threshold, persistence never fires) and the model loses recent reference
+    # frames — the primary cause of content collapse after ~10-15 chunks.
+    anchor_force_every: int = 5
 
     # Streaming buffer dimensions
     # 8 latent frames ≈ 57 pixel frames ≈ 2.4 s of hard context from previous chunk.
@@ -149,6 +164,14 @@ class CLSSConfig:
     # strong visual continuity at the cost of ~17% more denoising work per chunk.
     overlap_latent_frames: int = 8
     new_latent_frames: int = 13
+
+    # §3.7  Open-loop model gain measurement.
+    # measure_g: run a second denoising pass with a perturbed overlap on every chunk
+    #   that has overlap, to track g = ||Δ_output||_F / ||δ_input||_F per-chunk.
+    #   Doubles denoising time for non-first chunks.  Requires a non-None generator.
+    # measure_g_epsilon: perturbation magnitude as a fraction of the overlap norm.
+    measure_g: bool = True
+    measure_g_epsilon: float = 0.01
 
     def __post_init__(self) -> None:
         if len(self.freq_gamma) != self.n_freq_bands:
@@ -176,9 +199,14 @@ class _PerChannelEMA:
     def __init__(self) -> None:
         self.mean: Optional[torch.Tensor] = None  # [C]
         self.std: Optional[torch.Tensor] = None   # [C]
+        self._init_std: Optional[torch.Tensor] = None  # [C] anchored to chunk-0
 
-    def update(self, latent: torch.Tensor, lam: float) -> None:
-        """Update EMA statistics.  latent: [B, C, F, H, W]"""
+    def update(self, latent: torch.Tensor, lam: float, sigma_max_drift: float = 0.0) -> None:
+        """Update EMA statistics.  latent: [B, C, F, H, W]
+
+        sigma_max_drift: if > 0, caps the per-channel EMA std to at most
+        (1 + sigma_max_drift) × the chunk-0 std, preventing gradual amplification.
+        """
         # [C, B*F*H*W]
         x = latent.float().permute(1, 0, 2, 3, 4).flatten(1)
         mu = x.mean(1)
@@ -186,9 +214,12 @@ class _PerChannelEMA:
         if self.mean is None:
             self.mean = mu.clone()
             self.std = sig.clone()
+            self._init_std = sig.clone()
         else:
             self.mean = (1.0 - lam) * self.mean + lam * mu
             self.std  = (1.0 - lam) * self.std  + lam * sig
+            if sigma_max_drift > 0.0 and self._init_std is not None:
+                self.std = self.std.clamp(max=self._init_std * (1.0 + sigma_max_drift))
 
     def apply_adain(self, latent: torch.Tensor, beta: float) -> torch.Tensor:
         """Blend *latent* toward the EMA statistics via per-channel AdaIN.
@@ -365,8 +396,19 @@ class _AnchorBank:
         feat = self._feature(frame_latent)
         self.anchors = [_AnchorEntry(feature=feat, latent=frame_latent.clone(), frame_idx=frame_idx)]
 
-    def update(self, frame_latent: torch.Tensor, frame_idx: int, chunk_idx: int) -> None:
-        """Evaluate scene-change condition; commit a new anchor if triggered."""
+    def update(
+        self,
+        frame_latent: torch.Tensor,
+        frame_idx: int,
+        chunk_idx: int,
+        force: bool = False,
+    ) -> None:
+        """Evaluate scene-change condition; commit a new anchor if triggered.
+
+        force=True bypasses the threshold/persistence check and always adds an
+        anchor.  Used for periodic forced insertions so the bank always contains
+        recent frames (prevents content drift on long, visually-stable videos).
+        """
         feat = self._feature(frame_latent)
         sim = self._max_cosine_sim(feat)
         if sim < self.threshold:
@@ -374,8 +416,11 @@ class _AnchorBank:
         else:
             self._below_count = 0
 
-        if self._below_count >= self.persistence:
-            self._below_count = 0
+        if force or self._below_count >= self.persistence:
+            if force:
+                self._below_count = 0  # forced insert resets streak
+            else:
+                self._below_count = 0
             self.anchors.append(
                 _AnchorEntry(
                     feature=feat,
@@ -479,6 +524,9 @@ class CLSSState:
         self._overlap_latent: Optional[torch.Tensor] = None   # [1, C, overlap_F, H, W]
         self._chunk_index: int = 0
         self._abs_frame_idx: int = 0  # next absolute latent frame index to be written
+        # §3.7 Open-loop model gain: set by the pipeline after a perturbation experiment
+        self.g_measured: Optional[float] = None
+        self.rho_closed: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Step 2  — Overlap conditioning with implicit re-noising (§2.1)
@@ -567,6 +615,9 @@ class CLSSState:
             )
 
         # §2.3 AdaIN blended toward EMA reference (no-op when EMA uninitialised)
+        # Fixed β from config — the paper uses a constant β in [0.20, 0.40].
+        # Stability is verified via ρ = (1−β)·α(τ_c)·g < 1 (§3.7), not enforced
+        # adaptively; adaptive β over-normalises latents and destroys natural variation.
         out = self._ema.apply_adain(new_frames, cfg.beta)
 
         if logger.isEnabledFor(logging.DEBUG) and self._ema.mean is not None:
@@ -574,11 +625,11 @@ class CLSSState:
             ema_mu_mean = sum(self._ema.mean.tolist()) / len(self._ema.mean)
             ema_sig_mean = sum(self._ema.std.tolist()) / len(self._ema.std)
             logger.debug(
-                "[CLSS] chunk=%d  after_adain  μ̄=%.4f  σ̄=%.4f  "
+                "[CLSS] chunk=%d  after_adain  μ̄=%.4f  σ̄=%.4f  β=%.4f  "
                 "ema_ref: μ̄_ema=%.4f  σ̄_ema=%.4f",
                 cidx,
                 sum(mu_adain) / len(mu_adain), sum(sig_adain) / len(sig_adain),
-                ema_mu_mean, ema_sig_mean,
+                cfg.beta, ema_mu_mean, ema_sig_mean,
             )
 
         # §2.4 Frequency-band soft shrinkage (updates band EMA internally)
@@ -588,7 +639,7 @@ class CLSSState:
         )
 
         # §2.3 Update per-channel EMA with the corrected output (step 7)
-        self._ema.update(out, cfg.ema_lambda)
+        self._ema.update(out, cfg.ema_lambda, sigma_max_drift=cfg.ema_sigma_max_drift)
 
         if logger.isEnabledFor(logging.DEBUG):
             mu_final, sig_final = _chan_stats(out)
@@ -621,7 +672,13 @@ class CLSSState:
         if self._chunk_index == 0:
             self._anchor_bank.initialize(last_frame, abs_last_frame_idx)
         else:
-            self._anchor_bank.update(last_frame, abs_last_frame_idx, self._chunk_index)
+            forced = (
+                cfg.anchor_force_every > 0
+                and self._chunk_index % cfg.anchor_force_every == 0
+            )
+            self._anchor_bank.update(
+                last_frame, abs_last_frame_idx, self._chunk_index, force=forced,
+            )
 
         if logger.isEnabledFor(logging.DEBUG):
             feat = _AnchorBank._feature(last_frame)

@@ -68,7 +68,7 @@ import sys
 from pathlib import Path
 
 # Must be set before CUDA initializes. Reduces allocator fragmentation —
-# we're running close to the 16 GB ceiling (NF4 model ~10.6 GB + per-chunk
+# we're running close to the 16 GB ceiling (model blocks ~5 GB + per-chunk
 # activations), and the stock allocator was failing to allocate ~700 MiB
 # while several hundred MiB sat "reserved but unallocated" from fragmentation.
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -89,12 +89,9 @@ for _pkg in ("ltx-core", "ltx-pipelines"):
 # ---------------------------------------------------------------------------
 from ltx_core.block_streaming.gguf_builder import (
     GemmaGGUFStreamingModelBuilder,
-    GGUFDirectGPUReader,
     GGUFStreamingModelBuilder,
-    _scan_gguf_keys,
 )
-from ltx_core.block_streaming.utils import assign_tensor_to_module, resolve_attr
-from ltx_core.loader.helpers import create_meta_model, read_model_config
+
 from ltx_core.components.guiders import MultiModalGuiderParams
 from ltx_core.loader.gguf_loader import CombinedStateDictLoader, GGUFStateDictLoader
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -141,6 +138,7 @@ from ltx_core.model.video_vae import (
 )
 from ltx_pipelines.streaming import CLSSConfig, CLSSStreamingPipeline
 from ltx_pipelines.streaming.pipeline import build_chunk_schedule, _pixel_to_latent_frames
+from ltx_pipelines.utils.args import CompileAction
 from ltx_pipelines.utils.blocks import ImageConditioner, VideoDecoder
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import OffloadMode
@@ -202,7 +200,7 @@ _DEFAULT_PROMPTS = [
 # the last frames (farthest from any frozen reference) to look "out of touch".
 # freq_gamma conservative: (0.5,0.8) attenuated 13-14% per chunk; now (0.2,0.3).
 _DEFAULT_TAU_C   = 0.05
-_DEFAULT_BETA    = 0.25
+_DEFAULT_BETA    = 0.40
 _DEFAULT_LAMBDA  = 0.10
 _DEFAULT_OVERLAP = 8
 _DEFAULT_NEW_LF  = 13
@@ -237,210 +235,6 @@ def _vram_gb() -> float | None:
     if torch.cuda.is_available():
         return torch.cuda.get_device_properties(0).total_memory / 1024**3
     return None
-
-
-# ---------------------------------------------------------------------------
-# NF4 persistent GPU model  (eliminates block-streaming overhead)
-# ---------------------------------------------------------------------------
-
-def _quantize_block_linear_to_nf4(block: torch.nn.Module, device: torch.device) -> None:
-    """Replace all nn.Linear in *block* with bitsandbytes Linear4bit (NF4), in-place.
-
-    Snapshot before iterating so tree mutations don't invalidate the iterator.
-    Each BF16 weight on GPU is quantized in-place via Params4bit.to(device).
-    """
-    import bitsandbytes as bnb
-
-    replacements = [
-        (name, mod)
-        for name, mod in block.named_modules()
-        if isinstance(mod, torch.nn.Linear) and not mod.weight.is_meta
-    ]
-    for mod_name, module in replacements:
-        nf4 = bnb.nn.Linear4bit(
-            module.in_features,
-            module.out_features,
-            bias=module.bias is not None,
-            compute_dtype=torch.bfloat16,
-            quant_type="nf4",
-        )
-        # Params4bit.to(device) triggers BF16 → NF4 quantization on-device.
-        nf4.weight = bnb.nn.Params4bit(
-            module.weight.data, requires_grad=False, quant_type="nf4"
-        ).to(device)
-        if module.bias is not None:
-            nf4.bias = torch.nn.Parameter(module.bias.data, requires_grad=False)
-
-        if "." in mod_name:
-            parent_path, _, child_name = mod_name.rpartition(".")
-            parent: torch.nn.Module = block
-            for part in parent_path.split("."):
-                parent = getattr(parent, part)
-        else:
-            parent, child_name = block, mod_name
-        setattr(parent, child_name, nf4)
-
-
-def _build_nf4_gpu_model(
-    builder: GGUFStreamingModelBuilder,
-    target_device: torch.device,
-) -> torch.nn.Module:
-    """Load LTX-2.3 22B in NF4 format fully onto GPU (no block-streaming at inference).
-
-    Processes 48 blocks one at a time:
-      GGUF Q4_K_S  →  BF16 on GPU (temporary, ~900 MB)
-                   →  bitsandbytes NF4 on GPU (persistent, ~230 MB)
-
-    Total after all blocks: ~11 GB GPU.  No H2D transfer per denoising step.
-    """
-    import gc
-    from gguf import GGUFReader
-    from ltx_core.loader.gguf_loader import _to_bf16
-
-    logger.info("[NF4] Building meta model …")
-    config = read_model_config(builder.model_path, builder.model_loader)
-    meta_model = create_meta_model(builder.model_class_configurator, config, builder.module_ops)
-    meta_model.eval()
-
-    blocks = resolve_attr(meta_model, builder.blocks_attr)
-    block_key_map, non_block_keys = _scan_gguf_keys(
-        builder.model_path, builder.model_sd_ops, builder.blocks_prefix
-    )
-
-    # Non-block weights (embeddings, norms, etc.) → GPU BF16 (small, ~1 GB total)
-    logger.info("[NF4] Loading non-block weights …")
-    _gr = GGUFReader(builder.model_path)
-    _tmap = {t.name: t for t in _gr.tensors}
-    non_block_sd: dict[str, torch.Tensor] = {}
-    for gguf_key, model_key in non_block_keys:
-        t = _tmap.get(gguf_key)
-        if t is None:
-            continue
-        t_bf16 = _to_bf16(t.name, t.data, t.tensor_type).to(device=target_device, dtype=torch.bfloat16)
-        if builder.model_sd_ops is not None:
-            for out_key, out_val in builder.model_sd_ops.apply_to_key_value(model_key, t_bf16):
-                non_block_sd[out_key] = out_val
-        else:
-            non_block_sd[model_key] = t_bf16
-    del _tmap, _gr
-    meta_model.load_state_dict(non_block_sd, strict=False, assign=True)
-    del non_block_sd
-
-    # Transformer blocks: Q4_K_S → BF16 → NF4, one at a time
-    logger.info("[NF4] Loading %d transformer blocks (Q4_K_S → BF16 → NF4) …", len(blocks))
-    reader = GGUFDirectGPUReader(builder.model_path, block_key_map, target_device)
-
-    for block_idx in sorted(block_key_map.keys()):
-        block = blocks[block_idx]
-        block_params = dict(block.named_parameters())
-
-        # Allocate BF16 target tensors for this block on GPU
-        target: dict[str, torch.Tensor] = {
-            name: torch.empty(block_params[name].shape, dtype=torch.bfloat16, device=target_device)
-            for _, name in block_key_map[block_idx]
-            if name in block_params
-        }
-        # Dequantize GGUF → BF16 on GPU via existing GPU-dequant path
-        reader.read_into(target, block_idx)
-
-        # Assign BF16 tensors to block (replaces meta parameters with real ones)
-        for name, tensor in target.items():
-            assign_tensor_to_module(block, name, tensor)
-        del target
-
-        # Quantize block's Linear layers to NF4 (BF16 freed after quantization)
-        _quantize_block_linear_to_nf4(block, target_device)
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        if (block_idx + 1) % 8 == 0 or block_idx == len(block_key_map) - 1:
-            logger.info(
-                "[NF4] %d/%d blocks — GPU %.1f / %.1f GB",
-                block_idx + 1, len(block_key_map),
-                torch.cuda.memory_allocated() / 1e9,
-                torch.cuda.get_device_properties(0).total_memory / 1e9,
-            )
-
-    reader.cleanup()
-    logger.info("[NF4] All blocks loaded. GPU: %.1f GB", torch.cuda.memory_allocated() / 1e9)
-    return meta_model
-
-
-class _NF4ModelStub:
-    """Wraps NF4-quantized LTXModel for use as a `_streaming_model()` builder result.
-
-    `self.stage.model_context()` opens exactly ONE `_streaming_model()` context
-    around the *entire* CLSS chunk loop (not once per chunk — see pipeline.py),
-    so teardown()/.to("meta") only fire once, after the last chunk, right before
-    VAE decode. At that point the NF4 model is no longer needed, so we actually
-    free its ~10.6 GB of VRAM for real instead of no-op'ing — this is what gives
-    the VAE decoder room to work on long videos.
-    """
-
-    def __init__(self, model: torch.nn.Module) -> None:
-        self._model = model
-
-    def teardown(self) -> None:
-        pass
-
-    def to(self, *args: object, **kwargs: object) -> "_NF4ModelStub":
-        target = args[0] if args else kwargs.get("device", "")
-        if target == "meta" or (isinstance(target, torch.device) and target.type == "meta"):
-            # Do NOT call self._model.to("meta") — nn.Module._apply() rebuilds
-            # each Parameter via `Parameter(fn(param), requires_grad)`, and
-            # bitsandbytes' Params4bit.detach() doesn't return a Params4bit
-            # (returns a plain Tensor), so that reconstruction raises
-            # RuntimeError. Just drop our reference and let refcounting +
-            # gc free the underlying CUDA allocations instead.
-            import gc
-            self._model = None
-            gc.collect()
-            torch.cuda.empty_cache()
-            return self
-        self._model.to(*args, **kwargs)  # type: ignore[arg-type]
-        return self
-
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        return self._model(*args, **kwargs)
-
-    def __getattr__(self, name: str) -> object:
-        return getattr(self._model, name)
-
-
-class _FrozenStreamingBuilder:
-    """Streaming builder that always returns the same pre-built NF4 model stub."""
-
-    def __init__(self, stub: _NF4ModelStub) -> None:
-        self._stub = stub
-        self.module_ops: tuple = ()
-        self.model_sd_ops = None
-        self.loras: tuple = ()
-
-    def build(self, **_kwargs: object) -> _NF4ModelStub:
-        return self._stub
-
-    # Protocol stubs — DiffusionStage may call these when chaining builders
-    def with_module_ops(self, _ops: object) -> "_FrozenStreamingBuilder":
-        return self
-
-    def with_sd_ops(self, _ops: object) -> "_FrozenStreamingBuilder":
-        return self
-
-    def with_loras(self, _loras: object) -> "_FrozenStreamingBuilder":
-        return self
-
-    def with_fuse_rule(self, _rule: object) -> "_FrozenStreamingBuilder":
-        return self
-
-    def with_lora_load_device(self, _device: object) -> "_FrozenStreamingBuilder":
-        return self
-
-    def with_registry(self, _registry: object) -> "_FrozenStreamingBuilder":
-        return self
-
-    def model_config(self) -> dict:
-        return {}
 
 
 def _log_image_resize(path: str, target_h: int, target_w: int) -> None:
@@ -507,9 +301,12 @@ def _print_config_summary(args: argparse.Namespace, clss: CLSSConfig, num_frames
                 args.batch_size,
                 max(1, (2 + (1 if args.video_stg != 0 else 0) + (1 if args.modality_scale != 0 else 0))
                     // args.batch_size))
-    logger.info("  CLSS chunks  : %d  (τc=%.2f  β=%.2f  overlap=%d  new=%d lf)",
-                len(chunks), clss.tau_c, clss.beta,
-                clss.overlap_latent_frames, clss.new_latent_frames)
+    logger.info(
+        "  CLSS chunks  : %d  (τc=%.2f  β=%.2f  λ=%.2f  σ_max_drift=%.2f  "
+        "anchor_force=%d  overlap=%d  new=%d lf)",
+        len(chunks), clss.tau_c, clss.beta, clss.ema_lambda, clss.ema_sigma_max_drift,
+        clss.anchor_force_every, clss.overlap_latent_frames, clss.new_latent_frames,
+    )
     logger.info("  ρ_loop est.  : %.3f  (stable when < 1.0)", rho)
     logger.info("  Prompts      : %d  (last repeats for remaining chunks)", len(args.prompts))
     for i, pr in enumerate(args.prompts):
@@ -577,15 +374,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fps",         type=float, default=_DEFAULT_FPS)
 
     # --- Diffusion ---
-    p.add_argument("--steps",      type=int,   default=_DEFAULT_STEPS)
+    p.add_argument("--steps",      type=int,   default=_DEFAULT_STEPS,
+                   help="Denoising steps per chunk (default 30). 15 is 2× faster with "
+                        "minor quality drop; below 10 degrades noticeably.")
+    p.add_argument("--compile", nargs="*", default=None, action=CompileAction,
+                   help="Enable torch.compile for transformer blocks. "
+                        "Adds ~2-3 min warmup on first chunk; subsequent chunks are 15-25%% faster. "
+                        "Incompatible with --offload-mode (block-streaming). "
+                        "Pass alone for defaults, or KEY=VALUE to override: "
+                        "--compile mode=reduce-overhead")
     p.add_argument("--seed",       type=int,   default=_DEFAULT_SEED)
-    p.add_argument("--nf4", action="store_true", default=True,
-                   help="Pre-load the 22B transformer in bitsandbytes NF4 format on GPU (~11 GB). "
-                        "Eliminates per-step block-streaming H2D transfers (same as ComfyUI). "
-                        "Expected speedup: 4-8×.  Requires bitsandbytes ≥ 0.41.")
-    p.add_argument("--no-nf4", dest="nf4", action="store_false",
-                   help="Force CPU block-streaming mode (default before --nf4 was added). "
-                        "Required if GPU VRAM < 12 GB or bitsandbytes is not installed.")
     p.add_argument("--batch-size", type=int,   default=1,
                    help="Max guidance-pass batch size.  2=default: batches CFG cond+uncond "
                         "into one transformer call, halving block-streaming rounds.  "
@@ -613,17 +411,31 @@ def parse_args() -> argparse.Namespace:
                    help="Overlap re-noising τc (§2.1).  0=hardest constraint/most continuity, "
                         "0.05=recommended, 0.20=paper value (too loose for streaming 22B).")
     g.add_argument("--clss-beta",       type=float, default=_DEFAULT_BETA,
-                   help="AdaIN drift correction β (§2.3).  0=off, 0.25=recommended, 0.5=aggressive "
+                   help="AdaIN drift correction β (§2.3).  0=off, 0.40=recommended, 0.5=aggressive "
                         "(pulls too hard towards EMA dominated by chunk-0 stats).")
     g.add_argument("--clss-overlap",    type=int,   default=_DEFAULT_OVERLAP,
                    help="SLB overlap in latent frames.  4=default (~0.8s).  "
                         "8 gives better continuity at ~30%% more compute per chunk.")
     g.add_argument("--clss-lambda",     type=float, default=_DEFAULT_LAMBDA,
                    help="EMA update rate λ (§2.3/§2.4).  0.05=slow/stable, 0.10=faster drift correction.")
+    g.add_argument("--clss-sigma-max-drift", type=float, default=0.05,
+                   help="Max fractional growth of per-channel EMA σ relative to chunk-0 σ (§2.3). "
+                        "0.05 = EMA std may drift at most 5%% above its initial value, preventing "
+                        "AdaIN from amplifying late chunks.  0 = uncapped (old behaviour).")
+    g.add_argument("--clss-anchor-force-every", type=int, default=5,
+                   help="Force a new anchor into the bank every N chunks regardless of similarity. "
+                        "Prevents the bank from stagnating on chunk-0 frames when the scene is "
+                        "visually stable (similarity stays above threshold, persistence never fires). "
+                        "0 = disabled (similarity-only anchoring).")
     g.add_argument("--clss-new-frames", type=int,   default=_DEFAULT_NEW_LF,
                    help="New latent frames per chunk (13 lf ≈ 97 px ≈ 4 s @24 fps). "
                         "Smaller = less intra-chunk drift but more chunks. "
                         "21 caused intra_chunk_sim=0.03 (scene collapses); 13 is safer.")
+    g.add_argument("--no-measure-g", dest="measure_g", action="store_false", default=True,
+                   help="Disable per-chunk g measurement (§3.7). By default, every chunk with "
+                        "overlap runs a second perturbed denoising pass to measure g and "
+                        "ρ_closed = g·ρ_loop. Doubles denoising time per chunk. "
+                        "Pass --no-measure-g to skip.")
 
     # --- I/O ---
     p.add_argument("--output", default="output_clss.mp4")
@@ -633,6 +445,12 @@ def parse_args() -> argparse.Namespace:
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                    help="Logging verbosity. DEBUG adds per-channel latent stats, "
                         "band energy gains, and anchor similarity per chunk.")
+    p.add_argument("--checkpoint-dir", default=None,
+                   help="Directory for per-chunk JSONL research logs and periodic "
+                        "latent checkpoints. Defaults to '<output stem>_checkpoints'.")
+    p.add_argument("--checkpoint-every", type=int, default=5,
+                   help="Save a cumulative latent checkpoint every N chunks "
+                        "(only when there are more than N chunks total).")
 
     return p.parse_args()
 
@@ -685,8 +503,11 @@ def main() -> None:
         tau_c=args.clss_tau_c,
         beta=args.clss_beta,
         ema_lambda=args.clss_lambda,
+        ema_sigma_max_drift=args.clss_sigma_max_drift,
+        anchor_force_every=args.clss_anchor_force_every,
         overlap_latent_frames=args.clss_overlap,
         new_latent_frames=args.clss_new_frames,
+        measure_g=args.measure_g,
     )
 
     # Derive total pixel frames from chunk count.
@@ -778,6 +599,7 @@ def main() -> None:
         gemma_root=args.gemma_tokenizer,  # unused — streaming_text_encoder_builder takes over
         loras=[],
         offload_mode=OffloadMode.CPU,
+        compilation_config=args.compile,
         # Per-component paths (separate safetensors files)
         embeddings_path=args.embeddings_path,
         video_vae_path=args.video_vae_path,
@@ -817,62 +639,6 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # NF4 persistent GPU mode (optional, default on)
-    # Replace block-streaming with a GPU-resident NF4 model so every
-    # denoising step runs without H2D transfers — same as ComfyUI.
-    #
-    # IMPORTANT: text encoding (Gemma) must happen and fully UNLOAD first.
-    # The Gemma encoder and the NF4 transformer don't need to coexist on
-    # GPU — Gemma alone plus the 10.6 GB NF4 model blows past 16 GB VRAM.
-    # So we pre-encode prompts here (pipeline.prompt_encoder frees Gemma
-    # on exit via gpu_model -> .to("meta")), cache the result, and patch
-    # pipeline.prompt_encoder to replay the cached result instead of
-    # re-encoding when __call__ invokes it later.
-    # ------------------------------------------------------------------
-    if args.nf4:
-        try:
-            import bitsandbytes  # noqa: F401 — presence check
-
-            logger.info("Pre-encoding text prompts (Gemma) before NF4 load …")
-            _all_texts = list(args.prompts) + [args.negative_prompt]
-            _cached_contexts = pipeline.prompt_encoder(
-                _all_texts,
-                enhance_first_prompt=args.enhance_prompt,
-                enhance_prompt_seed=args.seed,
-            )
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            logger.info(
-                "Text encoding done, Gemma unloaded — GPU: %.1f GB",
-                torch.cuda.memory_allocated() / 1e9,
-            )
-
-            def _cached_prompt_encoder(_prompts: list[str], **_kwargs: object) -> object:
-                return _cached_contexts
-
-            pipeline.prompt_encoder = _cached_prompt_encoder
-
-            logger.info(
-                "NF4 mode: pre-loading 22B transformer in NF4 on GPU "
-                "(~11 GB, one-time cost ~2 min) …"
-            )
-            # Wrap immediately and drop the bare local — _stub.to("meta") later
-            # (see _NF4ModelStub.to) frees the model by clearing _stub._model,
-            # which only works if no other local variable still holds it.
-            _stub = _NF4ModelStub(_build_nf4_gpu_model(gguf_streaming_builder, pipeline.device))
-            pipeline.stage._streaming_builder = _FrozenStreamingBuilder(_stub)
-            logger.info(
-                "NF4 model ready — GPU: %.1f GB.  "
-                "No H2D streaming per denoising step.",
-                torch.cuda.memory_allocated() / 1e9,
-            )
-        except ImportError:
-            logger.warning(
-                "bitsandbytes not found — falling back to CPU block-streaming.  "
-                "Install with: pip install bitsandbytes"
-            )
-
-    # ------------------------------------------------------------------
     # Image conditioning (optional)
     # ------------------------------------------------------------------
     images = []
@@ -898,6 +664,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Run generation
     # ------------------------------------------------------------------
+    checkpoint_dir = args.checkpoint_dir or f"{Path(args.output).stem}_checkpoints"
     logger.info("Starting CLSS streaming generation …")
     video_iter, audio = pipeline(
         prompts=args.prompts,
@@ -929,6 +696,8 @@ def main() -> None:
         enhance_prompt=args.enhance_prompt,
         max_batch_size=args.batch_size,
         tiling_config=tiling_config,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_every=args.checkpoint_every,
     )
 
     # ------------------------------------------------------------------

@@ -135,6 +135,14 @@ class CLSSConfig:
     # from chunk 0's value, which prevents AdaIN from quietly amplifying late chunks
     # while still permitting slow intentional brightening / saturation changes.
     ema_sigma_max_drift: float = 0.05
+    # Maximum per-channel AdaIN upward amplification factor.
+    # When the EMA reference std for a channel exceeds the current chunk's std,
+    # AdaIN would amplify that channel's variance — boosting any residual
+    # denoising noise and causing visible grain in the decoded video.
+    # This cap limits how aggressively AdaIN can amplify: 1.2 = allow at most
+    # 20 % upward scaling.  0.0 = no cap (original behaviour).
+    # Recommended: 1.2 when noise/grain is visible, especially with < 30 steps.
+    adain_max_amplification: float = 0.0
 
     # §2.4  Frequency-band soft shrinkage
     # Keep gamma conservative: high values (0.5+) over-attenuate mid-frequency
@@ -221,12 +229,19 @@ class _PerChannelEMA:
             if sigma_max_drift > 0.0 and self._init_std is not None:
                 self.std = self.std.clamp(max=self._init_std * (1.0 + sigma_max_drift))
 
-    def apply_adain(self, latent: torch.Tensor, beta: float) -> torch.Tensor:
+    def apply_adain(
+        self, latent: torch.Tensor, beta: float, max_amplification: float = 0.0
+    ) -> torch.Tensor:
         """Blend *latent* toward the EMA statistics via per-channel AdaIN.
 
         Result = (1−β)·latent + β·AdaIN(latent → EMA).
         Returns the original latent unchanged when the EMA is uninitialised
         (first chunk).
+
+        max_amplification: if > 0, caps per-channel upward std scaling to this
+        factor.  E.g. 1.2 = allow the EMA reference to push a channel's std up
+        by at most 20 %.  Attenuation (EMA std < current std) is never capped.
+        Set to 0.0 to disable (original behaviour).
         """
         if self.mean is None:
             return latent
@@ -235,8 +250,14 @@ class _PerChannelEMA:
         x = latent.float().permute(1, 0, 2, 3, 4).flatten(1)
         mu_cur = x.mean(1, keepdim=True)
         sig_cur = x.std(1, keepdim=True).clamp(min=1e-5)
-        # Normalise to zero-mean/unit-std, then scale to EMA reference
-        corrected = (x - mu_cur) / sig_cur * self.std.unsqueeze(1) + self.mean.unsqueeze(1)
+        # Per-channel target std: optionally cap upward amplification so that
+        # channels with EMA std >> current std don't boost residual denoising noise.
+        target_std = self.std.unsqueeze(1)  # [C, 1]
+        if max_amplification > 0.0:
+            cap = sig_cur * max_amplification  # [C, 1]
+            target_std = torch.minimum(target_std, cap)
+        # Normalise to zero-mean/unit-std, then scale to (capped) EMA reference
+        corrected = (x - mu_cur) / sig_cur * target_std + self.mean.unsqueeze(1)
         blended = (1.0 - beta) * x + beta * corrected
         return blended.view(C, B, F, H, W).permute(1, 0, 2, 3, 4).to(latent.dtype)
 
@@ -346,6 +367,18 @@ def _apply_band_soft_shrinkage(
                 e_raw_mean, e_ref_mean, e_cor_mean, _band_gains[i],
             )
 
+    # §3.5 always-on telemetry: band gains and energies (backs paper claim "gains in [0.982,0.999]")
+    _e_ref_means = [
+        band_ema.energy[i].mean().item() if band_ema.energy else float("nan")
+        for i in range(n_bands)
+    ]
+    print(
+        f"[CLSS] chunk={chunk_idx}"
+        f"  band_gain=[{', '.join(f'{g:.4f}' for g in _band_gains)}]"
+        f"  band_E=[{', '.join(f'{raw_energies[i].mean().item():.3e}' for i in range(n_bands))}]"
+        f"  band_Eref=[{', '.join(f'{_e_ref_means[i]:.3e}' for i in range(n_bands))}]"
+    )
+
     # Update EMA with the corrected (post-gain) energies
     band_ema.update(corrected_energies, lam)
 
@@ -402,12 +435,13 @@ class _AnchorBank:
         frame_idx: int,
         chunk_idx: int,
         force: bool = False,
-    ) -> None:
+    ) -> bool:
         """Evaluate scene-change condition; commit a new anchor if triggered.
 
         force=True bypasses the threshold/persistence check and always adds an
         anchor.  Used for periodic forced insertions so the bank always contains
         recent frames (prevents content drift on long, visually-stable videos).
+        Returns True if a new anchor was committed this call.
         """
         feat = self._feature(frame_latent)
         sim = self._max_cosine_sim(feat)
@@ -416,6 +450,7 @@ class _AnchorBank:
         else:
             self._below_count = 0
 
+        committed = False
         if force or self._below_count >= self.persistence:
             if force:
                 self._below_count = 0  # forced insert resets streak
@@ -429,10 +464,12 @@ class _AnchorBank:
                     last_retrieved=chunk_idx,
                 )
             )
+            committed = True
             # LRU eviction: remove the anchor retrieved least recently
             while len(self.anchors) > self.max_size:
                 self.anchors.sort(key=lambda a: a.last_retrieved)
                 self.anchors.pop(0)
+        return committed
 
     # Anchors whose similarity to the current overlap exceeds this are redundant:
     # the VideoConditionByLatentIndex overlap conditioning already captures them.
@@ -618,7 +655,18 @@ class CLSSState:
         # Fixed β from config — the paper uses a constant β in [0.20, 0.40].
         # Stability is verified via ρ = (1−β)·α(τ_c)·g < 1 (§3.7), not enforced
         # adaptively; adaptive β over-normalises latents and destroys natural variation.
-        out = self._ema.apply_adain(new_frames, cfg.beta)
+        _ema_mu_log  = self._ema.mean.mean().item() if self._ema.mean is not None else float("nan")
+        _ema_sig_log = self._ema.std.mean().item()  if self._ema.std  is not None else float("nan")
+        _pre_mean = new_frames.float().mean().item()
+        _pre_std  = new_frames.float().std().item()
+        out = self._ema.apply_adain(new_frames, cfg.beta, cfg.adain_max_amplification)
+        # §2.3 always-on telemetry: EMA reference + AdaIN correction direction
+        print(
+            f"[CLSS] chunk={cidx}"
+            f"  ema_mu={_ema_mu_log:.4f}  ema_sigma={_ema_sig_log:.4f}"
+            f"  adain_delta_mean={out.float().mean().item() - _pre_mean:+.5f}"
+            f"  delta_std={out.float().std().item() - _pre_std:+.5f}"
+        )
 
         if logger.isEnabledFor(logging.DEBUG) and self._ema.mean is not None:
             mu_adain, sig_adain = _chan_stats(out)
@@ -671,24 +719,36 @@ class CLSSState:
         abs_last_frame_idx = self._abs_frame_idx + F_total - 1
         if self._chunk_index == 0:
             self._anchor_bank.initialize(last_frame, abs_last_frame_idx)
+            _new_anchor = True
         else:
             forced = (
                 cfg.anchor_force_every > 0
                 and self._chunk_index % cfg.anchor_force_every == 0
             )
-            self._anchor_bank.update(
+            _new_anchor = self._anchor_bank.update(
                 last_frame, abs_last_frame_idx, self._chunk_index, force=forced,
             )
 
+        # §2.5 always-on telemetry: anchor bank events
+        _feat_last  = _AnchorBank._feature(last_frame)
+        _max_sim    = self._anchor_bank._max_cosine_sim(_feat_last)
+        _bank_fids  = [a.frame_idx for a in self._anchor_bank.anchors]
+        print(
+            f"[CLSS] chunk={self._chunk_index}"
+            f"  anchors: bank_size={len(self._anchor_bank.anchors)}"
+            f"  last_frame_max_sim={_max_sim:.4f}"
+            f"  new_anchor={_new_anchor}"
+            f"  scene_change_streak={self._anchor_bank._below_count}"
+            f"  bank_frame_ids={_bank_fids}"
+        )
+
         if logger.isEnabledFor(logging.DEBUG):
-            feat = _AnchorBank._feature(last_frame)
-            max_sim = self._anchor_bank._max_cosine_sim(feat)
             logger.debug(
                 "[CLSS] chunk=%d  anchor_bank  n_anchors=%d  "
                 "last_frame_max_sim=%.4f  below_streak=%d  threshold=%.2f",
                 self._chunk_index,
                 len(self._anchor_bank.anchors),
-                max_sim,
+                _max_sim,
                 self._anchor_bank._below_count,
                 cfg.anchor_threshold,
             )

@@ -181,6 +181,22 @@ class CLSSConfig:
     measure_g: bool = True
     measure_g_epsilon: float = 0.01
 
+    # Temporally-correlated initial video noise (EXPERIMENTAL, off by default —
+    # unvalidated until a live run).  Targets the measured ~4 s layout
+    # oscillation, which is invariant to chunk length / overlap length / SLB
+    # strength: with i.i.d. noise every ~4 s span of frames carries an
+    # independent low-frequency "content suggestion" that the model resolves as
+    # a fresh motion arc at its trained temporal horizon.  Mixing a run-constant
+    # shared frame into every video noise frame,
+    #     n_t = sqrt(1-a)·eps_t + sqrt(a)·eps_shared,
+    # keeps each frame's marginal exactly N(0,1) but raises frame-to-frame noise
+    # correlation to a at ALL lags (inference-time correlated noise prior, same
+    # family as FreeNoise noise rescheduling / PYoCo mixed noise).  Unlike
+    # block-repeat schemes this cannot introduce a new periodicity.  0.0 = off
+    # (bit-exact baseline).  Worst case behaves like a seed change with more
+    # static content.
+    noise_temporal_corr: float = 0.0
+
     def __post_init__(self) -> None:
         if len(self.freq_gamma) != self.n_freq_bands:
             raise ValueError(
@@ -190,6 +206,10 @@ class CLSSConfig:
             raise ValueError(f"tau_c must be in [0, 1], got {self.tau_c}")
         if not 0.0 <= self.beta <= 1.0:
             raise ValueError(f"beta must be in [0, 1], got {self.beta}")
+        if not 0.0 <= self.noise_temporal_corr < 1.0:
+            raise ValueError(
+                f"noise_temporal_corr must be in [0, 1), got {self.noise_temporal_corr}"
+            )
 
 
 # ---------------------------------------------------------------------------

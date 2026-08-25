@@ -198,7 +198,6 @@ _DEFAULT_PROMPTS = [
 # 0.50 was too aggressive: EMA is dominated by chunk-0 stats (~80% weight after 3 chunks)
 # so beta=0.50 pulled each chunk strongly back towards the first chunk's look, causing
 # the last frames (farthest from any frozen reference) to look "out of touch".
-# freq_gamma conservative: (0.5,0.8) attenuated 13-14% per chunk; now (0.2,0.3).
 _DEFAULT_TAU_C   = 0.05
 _DEFAULT_BETA    = 0.40
 _DEFAULT_LAMBDA  = 0.10

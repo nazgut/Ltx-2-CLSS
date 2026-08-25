@@ -1,7 +1,7 @@
 """
 Closed-Loop Streaming Synthesis (CLSS) algorithm components.
 
-CLSS extends Latent Streaming Synthesis (LSS) with four closed-loop corrections that
+CLSS extends Latent Streaming Synthesis (LSS) with three closed-loop corrections that
 eliminate the exposure-bias drift accumulation inherent in open-loop streaming:
 
   §2.1  Calibrated context re-noising
@@ -19,14 +19,6 @@ eliminate the exposure-bias drift accumulation inherent in open-loop streaming:
         evolution (lighting changes, scene content) passes through.  Applied as a
         per-channel AdaIN-style renormalisation blended with factor β.
 
-  §2.4  Frequency-band soft shrinkage
-        The latent is decomposed into B spatio-temporal frequency bands via a 3-D
-        FFT.  Each band b receives a continuous gain min(1, (E_ref_b / E_b)^γ_b).
-        Only bands with excess energy relative to their EMA reference are
-        attenuated, and only by the excess, so on-reference texture passes
-        untouched while temporal flicker (high temporal frequency bands) is
-        suppressed.
-
   §2.5  Dynamic anchor bank
         A small bank of anchor keyframes is maintained.  The first frame of the
         first chunk seeds the bank.  Persistent cosine-similarity drops (below
@@ -42,15 +34,14 @@ Algorithm 1 (per-chunk step):
   3.  A_m        ← top-m anchors by feature similarity  [§2.5]
   4.  L_N        ← Generate(L̃_overlap, A_m, prompt)
   5.  L_N        ← AdaIN lerp toward per-channel EMA ref, factor β  [§2.3]
-  6.  L_N        ← band-wise soft shrinkage              [§2.4]
-  7.  EMA refs   ← update(L_N); anchor bank ← update on persistent scene change
-  8.  SLB.push(trailing frames)
+  6.  EMA refs   ← update(L_N); anchor bank ← update on persistent scene change
+  7.  SLB.push(trailing frames)
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -89,14 +80,8 @@ class CLSSConfig:
         AdaIN correction blend factor (§2.3).  0 = no correction, 1 = full
         replacement with reference statistics.  Recommended: 0.2–0.4.
     ema_lambda:
-        EMA update rate per chunk (§2.3 / §2.4).  Slow enough to track intended
+        EMA update rate per chunk (§2.3).  Slow enough to track intended
         scene evolution while suppressing per-chunk drift.  Recommended: 0.05–0.10.
-    n_freq_bands:
-        Number of 3-D FFT frequency bands (§2.4).  4 is sufficient for most cases.
-    freq_gamma:
-        Per-band shrinkage exponent γ_b (§2.4, Eq. 5).  Element 0 = DC band
-        (should be 0.0, never shrink structure/motion); last element = highest
-        temporal-frequency band (flicker).  Length must equal n_freq_bands.
     anchor_threshold:
         Cosine-similarity threshold below which a chunk is considered a candidate
         scene change (§2.5).  Default 0.78 (from the paper).
@@ -144,16 +129,6 @@ class CLSSConfig:
     # Recommended: 1.2 when noise/grain is visible, especially with < 30 steps.
     adain_max_amplification: float = 0.0
 
-    # §2.4  Frequency-band soft shrinkage
-    # Keep gamma conservative: high values (0.5+) over-attenuate mid-frequency
-    # content and degrade cosine similarity at chunk boundaries.
-    n_freq_bands: int = 4
-    # Band 0 = DC (never shrink: would kill global color/brightness).
-    # Band 1 = low spatial/temporal frequency: small γ prevents gradual energy
-    #          compounding without touching scene structure (observed +18-19 %
-    #          uncorrected growth over 17 chunks in testing).
-    freq_gamma: tuple[float, ...] = (0.0, 0.05, 0.2, 0.3)
-
     # §2.5  Dynamic anchor bank
     anchor_threshold: float = 0.78
     anchor_persistence: int = 2
@@ -198,10 +173,6 @@ class CLSSConfig:
     noise_temporal_corr: float = 0.0
 
     def __post_init__(self) -> None:
-        if len(self.freq_gamma) != self.n_freq_bands:
-            raise ValueError(
-                f"len(freq_gamma)={len(self.freq_gamma)} must equal n_freq_bands={self.n_freq_bands}"
-            )
         if not 0.0 <= self.tau_c <= 1.0:
             raise ValueError(f"tau_c must be in [0, 1], got {self.tau_c}")
         if not 0.0 <= self.beta <= 1.0:
@@ -280,130 +251,6 @@ class _PerChannelEMA:
         corrected = (x - mu_cur) / sig_cur * target_std + self.mean.unsqueeze(1)
         blended = (1.0 - beta) * x + beta * corrected
         return blended.view(C, B, F, H, W).permute(1, 0, 2, 3, 4).to(latent.dtype)
-
-
-# ---------------------------------------------------------------------------
-# §2.4  Frequency-band soft shrinkage
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _BandEMARef:
-    """Per-band EMA of energy (mean squared amplitude) per channel."""
-    energy: list[torch.Tensor] = field(default_factory=list)  # each [C]
-
-    def update(self, energies: list[torch.Tensor], lam: float) -> None:
-        if not self.energy:
-            self.energy = [e.clone() for e in energies]
-        else:
-            self.energy = [
-                (1.0 - lam) * ref + lam * e
-                for ref, e in zip(self.energy, energies)
-            ]
-
-
-def _compute_radial_freq(
-    F_size: int, H_size: int, W_size: int, device: torch.device
-) -> torch.Tensor:
-    """Return [F, H, W] tensor of max-axis normalised frequency in [0, 0.5]."""
-    ff = torch.fft.fftfreq(F_size, device=device).abs().view(F_size, 1, 1)
-    fh = torch.fft.fftfreq(H_size, device=device).abs().view(1, H_size, 1)
-    fw = torch.fft.fftfreq(W_size, device=device).abs().view(1, 1, W_size)
-    # Use the maximum frequency across all three dimensions so that a
-    # spatial-only high-frequency pattern is treated the same as a temporal one.
-    return torch.maximum(torch.maximum(ff.expand(F_size, H_size, W_size),
-                                        fh.expand(F_size, H_size, W_size)),
-                          fw.expand(F_size, H_size, W_size))
-
-
-def _apply_band_soft_shrinkage(
-    latent: torch.Tensor,
-    band_ema: _BandEMARef,
-    n_bands: int,
-    gamma: tuple[float, ...],
-    lam: float,
-    chunk_idx: int = -1,
-) -> torch.Tensor:
-    """Decompose *latent* into frequency bands and apply per-band soft shrinkage.
-
-    Only bands whose current energy exceeds the EMA reference are attenuated
-    (gain ≤ 1).  Bands with γ = 0 are never attenuated (DC and low-frequency
-    structure is preserved exactly).  EMA references are updated after gains
-    are applied so that the reference tracks the corrected, not the raw, energy.
-
-    latent: [B, C, F, H, W]
-    Returns corrected latent with the same shape and dtype.
-    """
-    B, C, F, H, W = latent.shape
-    L = torch.fft.fftn(latent.float(), dim=(-3, -2, -1))  # [B, C, F, H, W] complex
-
-    radial = _compute_radial_freq(F, H, W, latent.device)  # [F, H, W]
-    thresholds = torch.linspace(0.0, 0.5, n_bands + 1, device=latent.device)
-
-    band_ffts: list[torch.Tensor] = []
-    raw_energies: list[torch.Tensor] = []  # before shrinkage, [C]
-
-    for i in range(n_bands):
-        lo = thresholds[i]
-        hi = thresholds[i + 1] if i < n_bands - 1 else thresholds[i + 1] + 1.0
-        mask = ((radial >= lo) & (radial < hi)).float()  # [F, H, W]
-        band_fft = L * mask.view(1, 1, F, H, W)
-        band_ffts.append(band_fft)
-        # Mean squared amplitude per channel: E_b^(c) = mean |L_b^(c)|^2
-        energy = band_fft.abs().pow(2).mean(dim=(0, 2, 3, 4)).clamp(min=1e-10)  # [C]
-        raw_energies.append(energy)
-
-    result_fft = torch.zeros_like(L)
-    corrected_energies: list[torch.Tensor] = []
-    _band_gains: list[float] = []  # mean gain per band for debug logging
-
-    for i, (bfft, g) in enumerate(zip(band_ffts, gamma)):
-        if g == 0.0 or not band_ema.energy:
-            # No shrinkage; pass through unchanged
-            result_fft = result_fft + bfft
-            corrected_energies.append(raw_energies[i])
-            _band_gains.append(1.0)
-        else:
-            e_ref = band_ema.energy[i]          # [C] EMA reference
-            e_cur = raw_energies[i]             # [C] current energy
-            # gain_b^(c) = min(1, (E_ref_b^(c) / E_cur_b^(c))^γ_b) ∈ (0, 1]
-            gain = (e_ref / e_cur).pow(g).clamp(max=1.0)  # [C]
-            gain_bcast = gain.view(1, C, 1, 1, 1)
-            shrunk = bfft * gain_bcast
-            result_fft = result_fft + shrunk
-            # Post-shrinkage energy: gain^2 * E_cur (in expectation)
-            corrected_energies.append(gain.pow(2) * e_cur)
-            _band_gains.append(gain.mean().item())
-
-    if logger.isEnabledFor(logging.DEBUG):
-        for i in range(n_bands):
-            e_raw_mean = raw_energies[i].mean().item()
-            e_cor_mean = corrected_energies[i].mean().item()
-            e_ref_mean = band_ema.energy[i].mean().item() if band_ema.energy else float("nan")
-            logger.debug(
-                "[CLSS] chunk=%d  freq_band=%d  γ=%.1f  "
-                "E_raw=%.4e  E_ref=%.4e  E_cor=%.4e  gain_mean=%.4f",
-                chunk_idx, i, gamma[i],
-                e_raw_mean, e_ref_mean, e_cor_mean, _band_gains[i],
-            )
-
-    # §3.5 always-on telemetry: band gains and energies (backs paper claim "gains in [0.982,0.999]")
-    _e_ref_means = [
-        band_ema.energy[i].mean().item() if band_ema.energy else float("nan")
-        for i in range(n_bands)
-    ]
-    print(
-        f"[CLSS] chunk={chunk_idx}"
-        f"  band_gain=[{', '.join(f'{g:.4f}' for g in _band_gains)}]"
-        f"  band_E=[{', '.join(f'{raw_energies[i].mean().item():.3e}' for i in range(n_bands))}]"
-        f"  band_Eref=[{', '.join(f'{_e_ref_means[i]:.3e}' for i in range(n_bands))}]"
-    )
-
-    # Update EMA with the corrected (post-gain) energies
-    band_ema.update(corrected_energies, lam)
-
-    out = torch.fft.ifftn(result_fft, dim=(-3, -2, -1)).real
-    return out.to(latent.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -539,10 +386,9 @@ class _AnchorBank:
 class CLSSState:
     """Persistent CLSS state maintained across all chunk steps.
 
-    Manages the four CLSS components:
+    Manages the three CLSS components:
     - Streaming Latent Buffer (SLB): the overlap latent passed to the next chunk
     - Per-channel EMA reference for AdaIN correction (§2.3)
-    - Band-energy EMA reference for frequency shrinkage (§2.4)
     - Dynamic anchor bank for long-range identity (§2.5)
 
     Usage::
@@ -558,7 +404,7 @@ class CLSSState:
             # 3. Extract new frames (drop the overlap region)
             new_frames = generated[:, :, overlap_lf:] if chunk_idx > 0 else generated
 
-            # 4. Apply CLSS corrections (§2.3 + §2.4), update EMA + anchor bank
+            # 4. Apply CLSS corrections (§2.3), update EMA + anchor bank
             corrected = clss.post_process(new_frames)
 
             # 5. Update the SLB for the next iteration
@@ -571,7 +417,6 @@ class CLSSState:
     def __init__(self, config: CLSSConfig) -> None:
         self.config = config
         self._ema = _PerChannelEMA()
-        self._band_ema = _BandEMARef()
         self._anchor_bank = _AnchorBank(
             threshold=config.anchor_threshold,
             persistence=config.anchor_persistence,
@@ -584,6 +429,17 @@ class CLSSState:
         # §3.7 Open-loop model gain: set by the pipeline after a perturbation experiment
         self.g_measured: Optional[float] = None
         self.rho_closed: Optional[float] = None
+
+    def reset_drift_refs(self) -> None:
+        """Drop the §2.3 EMA reference (call on a scene change).
+
+        The next chunk is then treated like chunk 0: ``apply_adain`` is a no-op
+        for it and ``update`` re-seeds the EMA from its statistics — including
+        ``_init_std``, the anchor for the ``ema_sigma_max_drift`` cap.  Without
+        this, a scene change keeps pulling the new scene's per-channel stats
+        toward the old scene's EMA for several chunks (β-weighted color drag).
+        """
+        self._ema = _PerChannelEMA()
 
     # ------------------------------------------------------------------
     # Step 2  — Overlap conditioning with implicit re-noising (§2.1)
@@ -648,12 +504,12 @@ class CLSSState:
     # ------------------------------------------------------------------
 
     def post_process(self, new_frames: torch.Tensor) -> torch.Tensor:
-        """Apply AdaIN (§2.3) and frequency shrinkage (§2.4) to *new_frames*.
+        """Apply AdaIN (§2.3) to *new_frames*.
 
-        Both corrections are applied to the *new* frames only (the overlap region
+        The correction is applied to the *new* frames only (the overlap region
         is not post-processed — it was already corrected when it was generated).
         EMA references are updated with the fully corrected output (Algorithm 1,
-        step 7).
+        step 6).
 
         new_frames: [1, C, F, H, W]
         Returns corrected latent with the same shape and dtype.
@@ -671,22 +527,16 @@ class CLSSState:
                 min(mu_raw), max(mu_raw), min(sig_raw), max(sig_raw),
             )
 
-        # §2.3 AdaIN blended toward EMA reference (no-op when EMA uninitialised)
-        # Fixed β from config — the paper uses a constant β in [0.20, 0.40].
-        # Stability is verified via ρ = (1−β)·α(τ_c)·g < 1 (§3.7), not enforced
-        # adaptively; adaptive β over-normalises latents and destroys natural variation.
-        _ema_mu_log  = self._ema.mean.mean().item() if self._ema.mean is not None else float("nan")
-        _ema_sig_log = self._ema.std.mean().item()  if self._ema.std  is not None else float("nan")
         _pre_mean = new_frames.float().mean().item()
         _pre_std  = new_frames.float().std().item()
         out = self._ema.apply_adain(new_frames, cfg.beta, cfg.adain_max_amplification)
         # §2.3 always-on telemetry: EMA reference + AdaIN correction direction
-        print(
-            f"[CLSS] chunk={cidx}"
-            f"  ema_mu={_ema_mu_log:.4f}  ema_sigma={_ema_sig_log:.4f}"
-            f"  adain_delta_mean={out.float().mean().item() - _pre_mean:+.5f}"
-            f"  delta_std={out.float().std().item() - _pre_std:+.5f}"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            print(
+                f"[CLSS] chunk={cidx}"
+                f"  adain_delta_mean={out.float().mean().item() - _pre_mean:+.5f}"
+                f"  delta_std={out.float().std().item() - _pre_std:+.5f}"
+            )
 
         if logger.isEnabledFor(logging.DEBUG) and self._ema.mean is not None:
             mu_adain, sig_adain = _chan_stats(out)
@@ -700,13 +550,7 @@ class CLSSState:
                 cfg.beta, ema_mu_mean, ema_sig_mean,
             )
 
-        # §2.4 Frequency-band soft shrinkage (updates band EMA internally)
-        out = _apply_band_soft_shrinkage(
-            out, self._band_ema, cfg.n_freq_bands, cfg.freq_gamma, cfg.ema_lambda,
-            chunk_idx=cidx,
-        )
-
-        # §2.3 Update per-channel EMA with the corrected output (step 7)
+        # §2.3 Update per-channel EMA with the corrected output (step 6)
         self._ema.update(out, cfg.ema_lambda, sigma_max_drift=cfg.ema_sigma_max_drift)
 
         if logger.isEnabledFor(logging.DEBUG):
